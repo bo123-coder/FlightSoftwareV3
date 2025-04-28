@@ -1,0 +1,2 @@
+4/27/2025
+Flight Computer Assembled!! The teensy 4.1 isn't working quite right though- we also need at least one more MOSFET T^T 
