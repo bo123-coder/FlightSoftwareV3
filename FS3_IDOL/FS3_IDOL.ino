@@ -8,30 +8,33 @@
 #include <Servo.h>
 #include <vector>
 
+//Flight Parameters
+float AltitudeSetpoint_m = 240; //241 for qualifying, 248 and 236 for finals
+float QNH_hPa = 1023;  //current sea level barometric pressure (1015 for Santa Fe Dam, 1023 for home)
+float range_deg = 60; // movement range of servo
 
+
+//Other Variables
 Adafruit_BMP3XX bmp;
 Adafruit_ICM20948 imu;
 File flightData;
 File mel;
-Servo Airbrakes_Servo;
+Servo Servo1;
+Servo Servo2;
+Servo Servo3;
 
 uint16_t measurement_delay_us = 65535; 
-
 const int chipSelect = BUILTIN_SDCARD;
-
-float QNH = 1023;  //current sea level barrometric pressure (1015 for Santa Fe Dam, 1023 for home)
 const int BMP_address = 0x77;
 
-float pressure;
-float altimeter;
-float integrated_accel = 0;
-float accel;
-float velocity;
-char charRead;
-float groundLevel;
-bool HaveGroundLevel = false;
+float pressure_hPa;
+float altimeter_m;
+float integrated_accel_m_s = 0;
+float accel_ms2;
 
-float range_degrees = 60;
+char charRead;
+float groundLevel_m;
+bool HaveGroundLevel = false;
 
 char dataStr[200] = "";
 char buffer[7];
@@ -44,13 +47,26 @@ std::vector<uint32_t> runTime = {};
 
 int State = 0;
 
+//Pin definitions
+int Pyro1 = 6;
+int Pyro2 = 7;
+int VoltagePin = 40;
+int RED = 21;
+int BLU = 17;
+int GRN = 14;
+int BUZZER = 36;
+
+
+
 void setup() {
   // put your setup code here, to run once:
   pinMode(LED_BUILTIN, OUTPUT);
   Serial.begin(9600);
   delay(2000);
 
-  Airbrakes_Servo.attach(3);
+  Servo1.attach(3);
+  Servo2.attach(4);
+  Servo3.attach(5);
 
   if (bmp.begin_I2C(BMP_address)) {
     Serial.println("Barometer is present");
@@ -72,7 +88,7 @@ void setup() {
   }
 
     if (imu.begin_I2C()) {
-    Serial.println("IMU card is present");
+    Serial.println("IMU chip is present");
   } else {
     Serial.println("IMU failure");
     while (1);  //halt program
@@ -90,22 +106,8 @@ void setup() {
 
 // put your main code here, to run repeatedly:
 void loop() {
-
   dataStr[0] = 0;
-  //Take sensor input / SITL input
-  //  /* Get a new normalized sensor event */
-  sensors_event_t a;
-  sensors_event_t g;
-  sensors_event_t m;
-  sensors_event_t t;
-
-  //sensors_event_t g; //do we want gyros??
-  altimeter = bmp.readAltitude(QNH);
-  imu.getEvent(&a, &g, &t, &m); //add &g to here if we want gyros
-  accel = a.acceleration.z;
-
-  velocity += accel;
-
+  GetNav();
   //also figure out apogee prediction 
   int estApogee = predictApogee(altimeter, accel);
 
@@ -256,5 +258,29 @@ void WriteToFile(){
     Serial.println("error opening csv.txt");
   }
 
+}
+
+std::vector<std::vector<float>> GetNav(){
+  //return all navigation data: Altitude, Acceleration, Velocity IN THAT ORDER. TO BE ADDED: Attitude
+  std::vector<std::vector<float>> Data;
+  //  /* Get a new normalized sensor event */
+  sensors_event_t a;
+  sensors_event_t g;
+  sensors_event_t m;
+  sensors_event_t t;
+
+  Data.emplace_back(bmp.readAltitude(QNH_hPa));
+  imu.getEvent(&a, &g, &t, &m); 
+  Data.emplace_back(a.acceleration.y);
+  velocity += accel; //integrate acceleration
+  Data.emplace_back(velocity);
+
+  return Data;
+
+}
+
+std::vector<std::vector<int>> SITL_GetNav(){
+  //return all software-in-the-loop navigation data: Altitude, Acceleration, Velocity IN THAT ORDER. TO BE ADDED: Attitude
+  std::vector<std::vector<float>> Data;
 }
 
