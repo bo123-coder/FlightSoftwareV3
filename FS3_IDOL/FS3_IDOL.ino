@@ -9,9 +9,28 @@
 #include <vector>
 
 //Flight Parameters
-float AltitudeSetpoint_m = 240; //241 for qualifying, 248 and 236 for finals
-float QNH_hPa = 1023;  //current sea level barometric pressure (1015 for Santa Fe Dam, 1023 for home)
-float range_deg = 60; // movement range of servo
+struct FlightProfile{
+  float AltitudeSetpoint_m = 240; //241 for qualifying, 248 and 236 for finals
+  float QNH_hPa = 1023;  //current sea level barometric pressure (1015 for Santa Fe Dam, 1023 for home)
+  float range_deg = 60; // movement range of servo
+};
+
+struct NavData {
+  float altitude;
+  float acceleration;
+  float velocity;
+};
+
+struct FlightRecord {
+  uint32_t timestamp;
+  float pressure;
+  float altitude;      // meters
+  float acceleration;  // m/s^2
+  float estimation;    // meters
+};
+
+const FlightProfile flightProfile; //const because we won't change parameters during flight
+
 
 
 //Other Variables
@@ -28,7 +47,7 @@ const int chipSelect = BUILTIN_SDCARD;
 const int BMP_address = 0x77;
 
 float pressure_hPa;
-float altimeter_m;
+float altitude_m;
 float integrated_accel_m_s = 0;
 float accel_ms2;
 
@@ -39,11 +58,7 @@ bool HaveGroundLevel = false;
 char dataStr[200] = "";
 char buffer[7];
 
-std::vector<float> pressureData = {};
-std::vector<short> altitudeData = {};
-std::vector<short> accelData = {};
-std::vector<short> estimationData = {};
-std::vector<uint32_t> runTime = {};
+std::vector<FlightRecord> flightLog;
 
 int State = 0;
 
@@ -107,13 +122,17 @@ void setup() {
 // put your main code here, to run repeatedly:
 void loop() {
   dataStr[0] = 0;
-  GetNav();
+  NavData nav = GetNav();
+  altitude_m = nav.altitude;
+  accel_ms2 = nav.acceleration;
+  integrated_accel_m_s = nav.velocity;
+
   //also figure out apogee prediction 
-  int estApogee = predictApogee(altimeter, accel);
+  int estApogee = predictApogee(altitude_m, accel_ms2);
 
   DeployBrakes(estApogee);
 
-  SetState(altimeter, accel, velocity);
+  SetState(altitude_m, accel_ms2, integrated_accel_m_s);
 
   //Swich case for the following: Idle, Launch Detection, boost, Burnout, Descent, Chutes, Safe
   switch(State){
@@ -183,15 +202,14 @@ void SDFileInit() {
 
 //saves data during flight
 void SaveData(float pressure, float altitude, float accel, float estimation){
-  short altimeter = altitude*10; // converts m to dekameter for precsicrion (1 decimal places), remember to truncate altitude to 1 decomal place
-  short accelerometer = accel * 100;//converts m/s^2 to hectometer /s^2 (2 decimal places), remember to truncate to 2 decimal places
+  FlightRecord record;
+  record.timestamp = millis();
+  record.pressure = pressure;
+  record.altitude = altitude;
+  record.acceleration = accel;
+  record.estimation = estimation;
 
-  short est = estimation * 10;
-  runTime.emplace_back(millis());
-  pressureData.emplace_back(pressure);
-  altitudeData.emplace_back(altimeter);
-  accelData.emplace_back(accelerometer);
-  estimationData.emplace_back(est);
+  flightLog.push_back(record);
 }
 
 void SetState(float altitude, float accel, float v){
@@ -216,7 +234,7 @@ float predictApogee(float altitude, float accel){
 
 void DeployBrakes(float estApogee){
   //code for timing goes here
-  Airbrakes_Servo.write(range_degrees); // full extension
+  Servo1.write(flightProfile.range_deg); // full extension
 }
 
 void WriteToFile(){
@@ -224,63 +242,55 @@ void WriteToFile(){
   flightData = SD.open("flightData.txt", FILE_WRITE);
 
   if (flightData) {
-    for (uint i = 0; i<= runTime.size(); i++){
+    for (const FlightRecord& record : flightLog) {
       dataStr[0] = 0;
 
-      itoa(runTime[i] , buffer, 10);
-      strcat(dataStr, buffer);     //add it onto the end
-      strcat(dataStr, ", ");       //append the delimeter
+      itoa(record.timestamp, buffer, 10); 
+      strcat(dataStr, buffer); //add time to buffer 
+      strcat(dataStr, ", "); //append delimeter
 
-      dtostrf(pressureData[i], 5, 1, buffer); // leave pressure alone
+      dtostrf(record.pressure, 5, 1, buffer); //5 is minumum width (we need at least this many characters!), 1 is precision (amount of decimal points)
       strcat(dataStr, buffer);
-      strcat(dataStr, ", ");       //append the delimeter
+      strcat(dataStr, ", ");
 
-      float a = altitudeData[i]/10;  //remember to divide altitude by 10 before saving 
-      dtostrf(a, 5, 1, buffer);  //5 is mininum width, 1 is precision; float value is copied onto buff
-      strcat(dataStr, buffer);           //append the coverted float
-      strcat(dataStr, ", ");       //append the delimeter
+      dtostrf(record.altitude, 5, 1, buffer); 
+      strcat(dataStr, buffer);
+      strcat(dataStr, ", ");
 
-      float accel = accelData[i]/100;   //remember to divide accel by 100 before saving
-      dtostrf(accel, 5, 1, buffer);  //5 is mininum width, 1 is precision; float value is copied onto buff
-      strcat(dataStr, buffer);           //append the coverted float
-      strcat(dataStr, ", ");       //append the delimeter
+      dtostrf(record.acceleration, 5, 2, buffer);
+      strcat(dataStr, buffer);
+      strcat(dataStr, ", ");
 
-      float est = estimationData[i]/10; //remember to divide estimation by 10 before saving 
-      dtostrf(est, 5, 1, buffer);  //5 is mininum width, 1 is precision; float value is copied onto buff
-      strcat(dataStr, buffer);           //append the coverted float
-      strcat(dataStr, NULL);       //terminate correctly
+      dtostrf(record.estimation, 5, 1, buffer);
+      strcat(dataStr, buffer);
 
       flightData.println(dataStr);
-
     }
-  
+
   }else {
     Serial.println("error opening csv.txt");
   }
 
 }
 
-std::vector<std::vector<float>> GetNav(){
+NavData GetNav(){
   //return all navigation data: Altitude, Acceleration, Velocity IN THAT ORDER. TO BE ADDED: Attitude
-  std::vector<std::vector<float>> Data;
+  NavData data;
+
   //  /* Get a new normalized sensor event */
   sensors_event_t a;
   sensors_event_t g;
   sensors_event_t m;
   sensors_event_t t;
 
-  Data.emplace_back(bmp.readAltitude(QNH_hPa));
+  data.altitude = bmp.readAltitude(flightProfile.QNH_hPa);
   imu.getEvent(&a, &g, &t, &m); 
-  Data.emplace_back(a.acceleration.y);
-  velocity += accel; //integrate acceleration
-  Data.emplace_back(velocity);
+  data.acceleration = a.acceleration.y;
 
-  return Data;
+  integrated_accel_m_s += data.acceleration;  // integrate acceleration
+  data.velocity = integrated_accel_m_s;
 
-}
+  return data;
 
-std::vector<std::vector<int>> SITL_GetNav(){
-  //return all software-in-the-loop navigation data: Altitude, Acceleration, Velocity IN THAT ORDER. TO BE ADDED: Attitude
-  std::vector<std::vector<float>> Data;
 }
 
