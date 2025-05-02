@@ -16,9 +16,9 @@ struct FlightProfile{
 };
 
 struct NavData {
-  float altitude;
-  float acceleration;
-  float velocity;
+  float altitude_m;
+  float velocity_m_s = 0;
+  float accel_ms2;
 };
 
 struct FlightRecord {
@@ -43,13 +43,11 @@ Servo Servo2;
 Servo Servo3;
 
 uint16_t measurement_delay_us = 65535; 
-const int chipSelect = BUILTIN_SDCARD;
+
 const int BMP_address = 0x77;
 
 float pressure_hPa;
-float altitude_m;
-float integrated_accel_m_s = 0;
-float accel_ms2;
+
 
 char charRead;
 float groundLevel_m;
@@ -60,17 +58,17 @@ char buffer[7];
 
 std::vector<FlightRecord> flightLog;
 
-int State = 0;
+uint8_t State = 0; //saves a little space, swich back to int if it doesnt work
 
 //Pin definitions
-int Pyro1 = 6;
-int Pyro2 = 7;
-int VoltagePin = 40;
-int RED = 21;
-int BLU = 17;
-int GRN = 14;
-int BUZZER = 36;
-
+const uint8_t chipSelect = BUILTIN_SDCARD;
+const uint8_t Pyro1 = 6;
+const uint8_t Pyro2 = 7;
+const uint8_t VoltagePin = 40;
+const uint8_t RED = 21;
+const uint8_t BLU = 17;
+const uint8_t GRN = 14;
+const uint8_t BUZZER = 36;
 
 
 void setup() {
@@ -90,9 +88,9 @@ void setup() {
     while (1);  //halt program
   }
 
-  bmp.setTemperatureOversampling(BMP3_OVERSAMPLING_8X);
-  bmp.setPressureOversampling(BMP3_OVERSAMPLING_4X);
-  bmp.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_3);
+  bmp.setTemperatureOversampling(BMP3_OVERSAMPLING_2X);
+  bmp.setPressureOversampling(BMP3_OVERSAMPLING_16X); //should get us less noise, revert to 8x if it doesnt work
+  bmp.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_1);
   bmp.setOutputDataRate(BMP3_ODR_50_HZ);
 
   if (SD.begin(chipSelect)) {
@@ -122,17 +120,14 @@ void setup() {
 // put your main code here, to run repeatedly:
 void loop() {
   dataStr[0] = 0;
-  NavData nav = GetNav();
-  altitude_m = nav.altitude;
-  accel_ms2 = nav.acceleration;
-  integrated_accel_m_s = nav.velocity;
+  NavData nav = GetNav(); //use SITL_GetNav() for testing
 
   //also figure out apogee prediction 
-  int estApogee = predictApogee(altitude_m, accel_ms2);
+  int estApogee = predictApogee(nav.altitude_m, nav.accel_ms2);
 
   DeployBrakes(estApogee);
 
-  SetState(altitude_m, accel_ms2, integrated_accel_m_s);
+  SetState(nav.altitude_m, nav.accel_ms2, nav.velocity_m_s);
 
   //Swich case for the following: Idle, Launch Detection, boost, Burnout, Descent, Chutes, Safe
   switch(State){
@@ -274,7 +269,7 @@ void WriteToFile(){
 }
 
 NavData GetNav(){
-  //return all navigation data: Altitude, Acceleration, Velocity IN THAT ORDER. TO BE ADDED: Attitude
+  //return all navigation data: Altitude, Acceleration, Velocity. TO BE ADDED: Attitude
   NavData data;
 
   //  /* Get a new normalized sensor event */
@@ -283,14 +278,24 @@ NavData GetNav(){
   sensors_event_t m;
   sensors_event_t t;
 
-  data.altitude = bmp.readAltitude(flightProfile.QNH_hPa);
+  data.altitude_m = bmp.readAltitude(flightProfile.QNH_hPa);
   imu.getEvent(&a, &g, &t, &m); 
-  data.acceleration = a.acceleration.y;
+  data.accel_ms2 = a.acceleration.y;
 
-  integrated_accel_m_s += data.acceleration;  // integrate acceleration
-  data.velocity = integrated_accel_m_s;
+  data.velocity_m_s += data.accel_ms2;  // integrate acceleration
 
   return data;
+}
 
+NavData SITL_GetNav(){
+  NavData data;
+  data.altitude_m = 0;
+  data.accel_ms2 = 0;
+  data.velocity_m_s = 0;
+  return data;
+}
+
+void DetectLaunch(){
+  //detect launch and track t+ time
 }
 
