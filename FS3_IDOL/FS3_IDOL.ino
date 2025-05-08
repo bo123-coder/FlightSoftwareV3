@@ -15,6 +15,8 @@ struct FlightProfile{
   float range_deg = 60; // movement range of servo
 };
 
+const FlightProfile flightProfile; //const because we won't change parameters during flight
+
 struct NavData {
   float altitude_m;
   float velocity_m_s = 0;
@@ -29,8 +31,40 @@ struct FlightRecord {
   float estimation;    // meters
 };
 
-const FlightProfile flightProfile; //const because we won't change parameters during flight
 
+/////////////////SIMULATION
+struct FlightSimConfig {
+  float mass_kg = 0.5;
+  float drag_coefficient = 0.75;
+  float cross_section_area_m2 = 0.01;
+  float thrust_N = 0;
+  float burn_time_s = 2.0;
+  float max_thrust_N = 20;
+  float air_density = 1.225; // kg/m^3
+};
+
+struct ThrustSample {
+  float time_s;     // time from ignition in seconds
+  float thrust_N;   // thrust in Newtons
+};
+
+const ThrustSample thrust_curve[] = {
+  {0.00, 0.0}, {0.05, 5.0}, {0.10, 15.0}, {0.25, 20.0}, {0.40, 18.0},
+  {0.60, 10.0}, {0.85, 5.0}, {1.20, 2.0}, {1.50, 0.5}, {2.00, 0.0}
+};
+
+const int NUM_THRUST_POINTS = sizeof(thrust_curve) / sizeof(thrust_curve[0]);
+
+
+
+FlightSimConfig simConfig;
+bool isSimulating = false;
+unsigned long simStartTime = 0;
+
+float sim_altitude = 0;
+float sim_velocity = 0;
+float sim_accel = 0;
+/////////////////SIMULATION
 
 
 //Other Variables
@@ -53,7 +87,7 @@ char charRead;
 float groundLevel_m;
 bool HaveGroundLevel = false;
 
-char dataStr[200] = "";
+char dataStr[64];
 char buffer[7];
 
 std::vector<FlightRecord> flightLog;
@@ -80,6 +114,12 @@ void setup() {
   Servo1.attach(3);
   Servo2.attach(4);
   Servo3.attach(5);
+  pinMode(Pyro1, OUTPUT);
+  pinMode(Pyro2, OUTPUT);
+  pinMode(RED, OUTPUT);
+  pinMode(BLU, OUTPUT);
+  pinMode(GRN, OUTPUT);
+  pinMode(BUZZER, OUTPUT);
 
   if (bmp.begin_I2C(BMP_address)) {
     Serial.println("Barometer is present");
@@ -119,54 +159,37 @@ void setup() {
 
 // put your main code here, to run repeatedly:
 void loop() {
-  dataStr[0] = 0;
-  NavData nav = GetNav(); //use SITL_GetNav() for testing
-
-  //also figure out apogee prediction 
-  int estApogee = predictApogee(nav.altitude_m, nav.accel_ms2);
-
-  DeployBrakes(estApogee);
-
-  SetState(nav.altitude_m, nav.accel_ms2, nav.velocity_m_s);
-
-  //Swich case for the following: Idle, Launch Detection, boost, Burnout, Descent, Chutes, Safe
-  switch(State){
-    case 0: 
-      //await command for launch detect mode
-      //periodic beep/flash/servo actuation
-      //maybe a diagnostic mode on serial?
-      break;
-
-    case 1: //launch detection, triggered manually
-      //start logging data
-      //watch out for accel spikes!
-      break;
-
-    case 2: //boost, triggered by accel spike at liftoff
-      //watch for burnout
-      break;
-
-    case 3: // coast, triggered by accel < 0
-      //deploy airbrakes and calculate apogee
-      break;
-
-    case 4: //descent, triggered by velocity < 0 (apogee)
-      //retract airbrakes
-      break;
-
-    case 5: // safe, triggered by landing (no accel spikes, average a is 9.81, also <5 agl for a few seconds)
-      //log data to SD card, beep and light up when finished
-      break;
-
-    case 6: // abort if excessive pitch or other anomaly- force write to sd card and retract airbrakes if out
-      break;
-
-    default:
-      
-      break;
-
+   if (Serial.available()) {
+    char command = Serial.read();
+    if (command == 'S') {  // Start simulation
+      isSimulating = true;
+      simStartTime = millis();
+      sim_altitude = 0;
+      sim_velocity = 0;
+      sim_accel = 0;
+      Serial.println("Simulation started");
+    }
   }
 
+  NavData nav = isSimulating ? SITL_GetNav() : GetNav();
+  int estApogee = predictApogee(nav.altitude_m, nav.accel_ms2);
+  DeployBrakes(estApogee);
+  SetState(nav.altitude_m, nav.accel_ms2, nav.velocity_m_s);
+  HandleState();
+
+ 
+}
+
+void HandleState() {
+  switch(State) {
+    case 0: HandleIdle(); break;
+    case 1: LaunchDetect(); break;
+    case 2: Boost(); break;
+    case 3: Coast(); break;
+    case 4: Descent(); break;
+    case 5: Safe(); break;
+    default:   break;
+  }
 }
 
 //intializes SD card files when we write to them
@@ -208,19 +231,24 @@ void SaveData(float pressure, float altitude, float accel, float estimation){
 }
 
 void SetState(float altitude, float accel, float v){
-  //code to set state goes here
-  if (State == 1 && accel > 30){
-    State = 2;
-  }else if (State == 2 && accel >= 0){
-    State = 3;
-  }else if (State == 3 && v<= 0){
-    State = 4;
-  }else if (State == 4 && altitude > 5){
-    State = 5;
-  }else{
-    State = 0;
+  switch(State) {
+    case 1:
+      if (accel > 30) State = 2;
+      break;
+    case 2:
+      if (accel >= 0) State = 3;
+      break;
+    case 3:
+      if (v <= 0) State = 4;
+      break;
+    case 4:
+      if (altitude < groundLevel_m + 5) State = 5;
+      break;
+    default:
+      break;
   }
 }
+
 
 float predictApogee(float altitude, float accel){
   int apogee = 0;
@@ -232,41 +260,31 @@ void DeployBrakes(float estApogee){
   Servo1.write(flightProfile.range_deg); // full extension
 }
 
-void WriteToFile(){
-  //order is Time,Pressure,Altitude,Acceleration,Estimation
+void WriteToFile() {
   flightData = SD.open("flightData.txt", FILE_WRITE);
 
   if (flightData) {
     for (const FlightRecord& record : flightLog) {
-      dataStr[0] = 0;
-
-      itoa(record.timestamp, buffer, 10); 
-      strcat(dataStr, buffer); //add time to buffer 
-      strcat(dataStr, ", "); //append delimeter
-
-      dtostrf(record.pressure, 5, 1, buffer); //5 is minumum width (we need at least this many characters!), 1 is precision (amount of decimal points)
-      strcat(dataStr, buffer);
-      strcat(dataStr, ", ");
-
-      dtostrf(record.altitude, 5, 1, buffer); 
-      strcat(dataStr, buffer);
-      strcat(dataStr, ", ");
-
-      dtostrf(record.acceleration, 5, 2, buffer);
-      strcat(dataStr, buffer);
-      strcat(dataStr, ", ");
-
-      dtostrf(record.estimation, 5, 1, buffer);
-      strcat(dataStr, buffer);
+      // Clear and format dataStr safely
+      snprintf(dataStr, sizeof(dataStr), "%lu,%.1f,%.1f,%.2f,%.1f",
+               record.timestamp,
+               record.pressure,
+               record.altitude,
+               record.acceleration,
+               record.estimation);
 
       flightData.println(dataStr);
+      if (!flightData.println(dataStr)) {
+      Serial.println("Write failed");
+      break;
     }
-
-  }else {
-    Serial.println("error opening csv.txt");
+    flightData.close();  // Important!
+    }
+  } else {
+    Serial.println("error opening flightData.txt");
   }
-
 }
+
 
 NavData GetNav(){
   //return all navigation data: Altitude, Acceleration, Velocity. TO BE ADDED: Attitude
@@ -282,20 +300,70 @@ NavData GetNav(){
   imu.getEvent(&a, &g, &t, &m); 
   data.accel_ms2 = a.acceleration.y;
 
-  data.velocity_m_s += data.accel_ms2;  // integrate acceleration
+  static unsigned long lastTime = 0;
+  unsigned long now = millis();
+  float dt = (now - lastTime) / 1000.0;
+  data.velocity_m_s += data.accel_ms2 * dt;
+  lastTime = now;
+
 
   return data;
 }
 
-NavData SITL_GetNav(){
+float getInterpolatedThrust(float time_s) {
+  if (time_s <= thrust_curve[0].time_s) return thrust_curve[0].thrust_N;
+  if (time_s >= thrust_curve[NUM_THRUST_POINTS - 1].time_s) return 0.0;
+
+  for (int i = 0; i < NUM_THRUST_POINTS - 1; ++i) {
+    float t1 = thrust_curve[i].time_s;
+    float t2 = thrust_curve[i + 1].time_s;
+
+    if (time_s >= t1 && time_s <= t2) {
+      float thrust1 = thrust_curve[i].thrust_N;
+      float thrust2 = thrust_curve[i + 1].thrust_N;
+
+      float ratio = (time_s - t1) / (t2 - t1);
+      return thrust1 + ratio * (thrust2 - thrust1);
+    }
+  }
+
+  return 0.0; // shouldn't reach here
+}
+
+NavData SITL_GetNav() {
   NavData data;
-  data.altitude_m = 0;
-  data.accel_ms2 = 0;
-  data.velocity_m_s = 0;
+
+  unsigned long now = millis();
+  float t = (now - simStartTime) / 1000.0f; // seconds since sim start
+  float dt = 0.02f;  // fixed timestep
+
+  float thrust = getInterpolatedThrust(t);
+
+  float drag = 0.5f * simConfig.air_density *
+               sim_velocity * sim_velocity *
+               simConfig.drag_coefficient *
+               simConfig.cross_section_area_m2;
+
+  if (sim_velocity < 0) drag *= -1;
+
+  float weight = simConfig.mass_kg * 9.81f;
+  float net_force = thrust - drag - weight;
+
+  sim_accel = net_force / simConfig.mass_kg;
+  sim_velocity += sim_accel * dt;
+  sim_altitude += sim_velocity * dt;
+
+  data.altitude_m = sim_altitude;
+  data.accel_ms2 = sim_accel;
+  data.velocity_m_s = sim_velocity;
+
   return data;
 }
 
-void DetectLaunch(){
-  //detect launch and track t+ time
-}
 
+void HandleIdle() {}
+void LaunchDetect() {}
+void Boost() {}
+void Coast() {}
+void Descent() {}
+void Safe() {}
