@@ -10,14 +10,16 @@
 
 //Flight Parameters
 struct FlightProfile{
-  float AltitudeSetpoint_m = 240; //241 for qualifying, 248 and 236 for finals
+  //float AltitudeSetpoint_m = 240; //241 for qualifying, 248 and 236 for finals
+  float brakeDeployAltitude_m = 120.0;  // Example altitude (meters AGL)
   float QNH_hPa = 1023;  //current sea level barometric pressure (1015 for Santa Fe Dam, 1023 for home)
-  float range_deg = 60; // movement range of servo
+  float range_deg = 5; // movement range of servo
 };
 
 const FlightProfile flightProfile; //const because we won't change parameters during flight
 
 struct NavData {
+  float pressure;
   float altitude_m;
   float velocity_m_s = 0;
   float accel_ms2;
@@ -35,8 +37,10 @@ struct FlightRecord {
 /////////////////SIMULATION
 struct FlightSimConfig {
   float mass_kg = 0.5;
-  float drag_coefficient = 0.75;
-  float cross_section_area_m2 = 0.01;
+  float Cd = 0.27;
+  float area_m2 = 0.01;
+  float Cd_brakes = 0.98;
+  float area_m2_brakes = 0.8;
   float thrust_N = 0;
   float burn_time_s = 2.0;
   float max_thrust_N = 20;
@@ -49,13 +53,13 @@ struct ThrustSample {
 };
 
 const ThrustSample thrust_curve[] = {
-  {0.00, 0.0}, {0.05, 5.0}, {0.10, 15.0}, {0.25, 20.0}, {0.40, 18.0},
-  {0.60, 10.0}, {0.85, 5.0}, {1.20, 2.0}, {1.50, 0.5}, {2.00, 0.0}
+  {0.001, 0.626}, {0.028, 3.962}, {0.04, 13.136}, {0.051, 29.608}, {0.178, 34.821},
+  {0.321 ,36.489},  {0.516, 37.74}, {0.712, 40.242}, {0.854, 41.911}, {0.947, 43.579}, {0.979, 46.498}, 
+  {0.999, 41.911},   {1.018, 33.779},   {1.04, 26.481},   {1.069, 19.6},   {1.104, 9.383},   {1.122, 3.128},
+  {1.141, 0.0}
 };
 
 const int NUM_THRUST_POINTS = sizeof(thrust_curve) / sizeof(thrust_curve[0]);
-
-
 
 FlightSimConfig simConfig;
 bool isSimulating = false;
@@ -65,7 +69,6 @@ float sim_altitude = 0;
 float sim_velocity = 0;
 float sim_accel = 0;
 /////////////////SIMULATION
-
 
 //Other Variables
 Adafruit_BMP3XX bmp;
@@ -82,10 +85,10 @@ const int BMP_address = 0x77;
 
 float pressure_hPa;
 
-
 char charRead;
 float groundLevel_m;
 bool HaveGroundLevel = false;
+bool brakesDeployed = false;
 
 char dataStr[64];
 char buffer[7];
@@ -104,10 +107,19 @@ const uint8_t BLU = 17;
 const uint8_t GRN = 14;
 const uint8_t BUZZER = 36;
 
+const uint8_t RBF_PIN = 11;         // Pin for Remove Before Flight tag
+bool launchDetected = false;
+unsigned long launchTime = 0;
+bool burnoutLogged = false;
+bool apogeeLogged = false;
+bool dataWritten = false;
+
 
 void setup() {
   // put your setup code here, to run once:
   pinMode(LED_BUILTIN, OUTPUT);
+  pinMode(RBF_PIN, INPUT_PULLUP); // expects to be grounded by RBF tag
+
   Serial.begin(9600);
   delay(2000);
 
@@ -172,21 +184,17 @@ void loop() {
   }
 
   NavData nav = isSimulating ? SITL_GetNav() : GetNav();
-  int estApogee = predictApogee(nav.altitude_m, nav.accel_ms2);
-  DeployBrakes(estApogee);
-  SetState(nav.altitude_m, nav.accel_ms2, nav.velocity_m_s);
-  HandleState();
-
- 
+  DeployBrakes(nav.altitude_m);
+  HandleState(nav.pressure, nav.altitude_m, nav.accel_ms2, nav.velocity_m_s);
 }
 
-void HandleState() {
+void HandleState(float pressure, float altitude, float accel, float v) {
   switch(State) {
     case 0: HandleIdle(); break;
-    case 1: LaunchDetect(); break;
-    case 2: Boost(); break;
-    case 3: Coast(); break;
-    case 4: Descent(); break;
+    case 1: LaunchDetect(accel); SaveData(pressure, altitude, accel, v); break;
+    case 2: Boost(); SaveData(pressure, altitude, accel, v); break;
+    case 3: Coast(); SaveData(pressure, altitude, accel, v); break;
+    case 4: Descent(); SaveData(pressure, altitude, accel, v); break;
     case 5: Safe(); break;
     default:   break;
   }
@@ -230,34 +238,17 @@ void SaveData(float pressure, float altitude, float accel, float estimation){
   flightLog.push_back(record);
 }
 
-void SetState(float altitude, float accel, float v){
-  switch(State) {
-    case 1:
-      if (accel > 30) State = 2;
-      break;
-    case 2:
-      if (accel >= 0) State = 3;
-      break;
-    case 3:
-      if (v <= 0) State = 4;
-      break;
-    case 4:
-      if (altitude < groundLevel_m + 5) State = 5;
-      break;
-    default:
-      break;
+void DeployBrakes(float currentAltitude) {
+  if (brakesDeployed || State >= 4) return;
+
+  // Deploy once altitude exceeds precomputed threshold
+  if (currentAltitude >= flightProfile.brakeDeployAltitude_m) {
+    brakesDeployed = true;
+
+    Servo1.write(flightProfile.range_deg);
+
+    Serial.println("Brakes deployed at altitude trigger.");
   }
-}
-
-
-float predictApogee(float altitude, float accel){
-  int apogee = 0;
-  return apogee;
-}
-
-void DeployBrakes(float estApogee){
-  //code for timing goes here
-  Servo1.write(flightProfile.range_deg); // full extension
 }
 
 void WriteToFile() {
@@ -297,6 +288,7 @@ NavData GetNav(){
   sensors_event_t t;
 
   data.altitude_m = bmp.readAltitude(flightProfile.QNH_hPa);
+  data.pressure = bmp.readPressure();
   imu.getEvent(&a, &g, &t, &m); 
   data.accel_ms2 = a.acceleration.y;
 
@@ -341,8 +333,8 @@ NavData SITL_GetNav() {
 
   float drag = 0.5f * simConfig.air_density *
                sim_velocity * sim_velocity *
-               simConfig.drag_coefficient *
-               simConfig.cross_section_area_m2;
+               simConfig.Cd *
+               simConfig.area_m2;
 
   if (sim_velocity < 0) drag *= -1;
 
@@ -361,8 +353,31 @@ NavData SITL_GetNav() {
 }
 
 
-void HandleIdle() {}
-void LaunchDetect() {}
+void HandleIdle() {
+  // Wait until RBF tag is removed (pin goes HIGH)
+    if (digitalRead(RBF_PIN) == HIGH) {
+    Serial.println("RBF removed. Entering Launch Detect mode.");
+    State = 1; // switch to LaunchDetect
+  }
+}
+
+void LaunchDetect(float accel) {
+  // Wait for launch acceleration spike (> 30 m/s²)
+
+  if (accel > 30.0f && !launchDetected) {
+    launchDetected = true;
+    launchTime = millis();
+
+    // Print only — no SD write
+    Serial.println("Launch detected!");
+    Serial.print("Launch time (ms): ");
+    Serial.println(launchTime);
+
+    State = 2; // Move to Boost phase
+  }
+  
+}
+
 void Boost() {}
 void Coast() {}
 void Descent() {}
