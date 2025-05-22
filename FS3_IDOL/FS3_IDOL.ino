@@ -35,6 +35,8 @@ struct FlightRecord {
 
 
 /////////////////SIMULATION
+bool isSimulating = false;
+
 struct FlightSimConfig {
   float mass_kg = 0.5;
   float Cd = 0.27;
@@ -62,7 +64,6 @@ const ThrustSample thrust_curve[] = {
 const int NUM_THRUST_POINTS = sizeof(thrust_curve) / sizeof(thrust_curve[0]);
 
 FlightSimConfig simConfig;
-bool isSimulating = false;
 unsigned long simStartTime = 0;
 
 float sim_altitude = 0;
@@ -95,7 +96,7 @@ char buffer[7];
 
 std::vector<FlightRecord> flightLog;
 
-uint8_t State = 0; //saves a little space, swich back to int if it doesnt work
+uint8_t systemState = 0; //saves a little space, swich back to int if it doesnt work
 
 //Pin definitions
 const uint8_t chipSelect = BUILTIN_SDCARD;
@@ -106,8 +107,11 @@ const uint8_t RED = 21;
 const uint8_t BLU = 17;
 const uint8_t GRN = 14;
 const uint8_t BUZZER = 36;
+const uint8_t RBF_PIN = 9;         // Pin for Remove Before Flight tag
+const uint8_t SERVO1_PIN = 3; 
+const uint8_t SERVO2_PIN = 4; 
+const uint8_t SERVO3_PIN = 5; 
 
-const uint8_t RBF_PIN = 11;         // Pin for Remove Before Flight tag
 bool launchDetected = false;
 unsigned long launchTime = 0;
 bool burnoutLogged = false;
@@ -122,10 +126,11 @@ void setup() {
 
   Serial.begin(9600);
   delay(2000);
+  Serial.println("IDOL FS3 INITIATED");
 
-  Servo1.attach(3);
-  Servo2.attach(4);
-  Servo3.attach(5);
+  Servo1.attach(SERVO1_PIN);
+  Servo2.attach(SERVO2_PIN);
+  Servo3.attach(SERVO3_PIN);
   pinMode(Pyro1, OUTPUT);
   pinMode(Pyro2, OUTPUT);
   pinMode(RED, OUTPUT);
@@ -137,7 +142,7 @@ void setup() {
     Serial.println("Barometer is present");
   } else {
     Serial.println("Barometer faliure");
-    while (1);  //halt program
+    //while (1);  //halt program
   }
 
   bmp.setTemperatureOversampling(BMP3_OVERSAMPLING_2X);
@@ -149,14 +154,14 @@ void setup() {
     Serial.println("SD card is present");
   } else {
     Serial.println("SD card failure");
-    while (1);  //halt program
+    //while (1);  //halt program
   }
 
     if (imu.begin_I2C()) {
     Serial.println("IMU chip is present");
   } else {
     Serial.println("IMU failure");
-    while (1);  //halt program
+    //while (1);  //halt program
   }
   imu.setAccelRange(ICM20948_ACCEL_RANGE_16_G);
   imu.setGyroRange(ICM20948_GYRO_RANGE_1000_DPS);
@@ -171,34 +176,43 @@ void setup() {
 
 // put your main code here, to run repeatedly:
 void loop() {
-   if (Serial.available()) {
-    char command = Serial.read();
-    if (command == 'S') {  // Start simulation
-      isSimulating = true;
-      simStartTime = millis();
-      sim_altitude = 0;
-      sim_velocity = 0;
-      sim_accel = 0;
-      Serial.println("Simulation started");
-    }
-  }
+  
 
   NavData nav = isSimulating ? SITL_GetNav() : GetNav();
-  DeployBrakes(nav.altitude_m);
-  HandleState(nav.pressure, nav.altitude_m, nav.accel_ms2, nav.velocity_m_s);
-}
 
-void HandleState(float pressure, float altitude, float accel, float v) {
-  switch(State) {
-    case 0: HandleIdle(); break;
-    case 1: LaunchDetect(accel); SaveData(pressure, altitude, accel, v); break;
-    case 2: Boost(); SaveData(pressure, altitude, accel, v); break;
-    case 3: Coast(); SaveData(pressure, altitude, accel, v); break;
-    case 4: Descent(); SaveData(pressure, altitude, accel, v); break;
-    case 5: Safe(); break;
-    default:   break;
+  Serial.print(nav.altitude_m);//remove before flight
+  Serial.print(", ");
+  Serial.print(nav.accel_ms2);
+  Serial.print(", ");
+  Serial.println(nav.velocity_m_s);
+
+  if (systemState == 0){  //Ground Startup 
+    HandleIdle();
+    HandleSITL();
+  }
+  else if (systemState == 1){  //waiting for launch
+    LaunchDetect(nav.accel_ms2);
+    SaveData(nav);
+  }
+  else if (systemState == 2){  //Boost
+    DetectBurnout(nav.accel_ms2);
+    SaveData(nav);
+  }
+  else if (systemState == 3){ //Coast
+    DeployBrakes(nav.altitude_m);
+    DetectApogee(nav.velocity_m_s);
+    SaveData(nav);
+  } 
+  else if (systemState == 4){ //Descent
+    DetectTouchdown(nav.altitude_m);
+    SaveData(nav);
+  }
+  else if (systemState == 5){ //Safe
+    WriteToFile();
   }
 }
+
+/////////////////FUNCTIONS
 
 //intializes SD card files when we write to them
 void SDFileInit() {
@@ -226,20 +240,36 @@ void SDFileInit() {
   }
 }
 
+void HandleSITL(){
+  if (Serial.available()) {
+    char command = tolower(Serial.read());  //force ucase
+    Serial.println(command);
+    if (command == 's') {  // Start simulation
+      isSimulating = true;
+      simStartTime = millis();
+      sim_altitude = 0;
+      sim_velocity = 0;
+      sim_accel = 0;
+      systemState = 1;
+      Serial.println("Simulation started");
+    }
+  }
+}
+
 //saves data during flight
-void SaveData(float pressure, float altitude, float accel, float estimation){
+void SaveData(NavData data){
   FlightRecord record;
   record.timestamp = millis();
-  record.pressure = pressure;
-  record.altitude = altitude;
-  record.acceleration = accel;
-  record.estimation = estimation;
+  record.pressure = data.pressure;
+  record.altitude = data.altitude_m;
+  record.acceleration = data.accel_ms2;
+  record.estimation = 0;
 
   flightLog.push_back(record);
 }
 
 void DeployBrakes(float currentAltitude) {
-  if (brakesDeployed || State >= 4) return;
+  if (brakesDeployed || systemState >= 4) return;
 
   // Deploy once altitude exceeds precomputed threshold
   if (currentAltitude >= flightProfile.brakeDeployAltitude_m) {
@@ -268,9 +298,9 @@ void WriteToFile() {
       if (!flightData.println(dataStr)) {
       Serial.println("Write failed");
       break;
+      }
     }
     flightData.close();  // Important!
-    }
   } else {
     Serial.println("error opening flightData.txt");
   }
@@ -349,6 +379,7 @@ NavData SITL_GetNav() {
   data.accel_ms2 = sim_accel;
   data.velocity_m_s = sim_velocity;
 
+
   return data;
 }
 
@@ -357,7 +388,7 @@ void HandleIdle() {
   // Wait until RBF tag is removed (pin goes HIGH)
     if (digitalRead(RBF_PIN) == HIGH) {
     Serial.println("RBF removed. Entering Launch Detect mode.");
-    State = 1; // switch to LaunchDetect
+    systemState = 1; // switch to LaunchDetect
   }
 }
 
@@ -373,12 +404,31 @@ void LaunchDetect(float accel) {
     Serial.print("Launch time (ms): ");
     Serial.println(launchTime);
 
-    State = 2; // Move to Boost phase
+    systemState = 2; // Move to Boost phase
   }
   
 }
 
-void Boost() {}
-void Coast() {}
-void Descent() {}
-void Safe() {}
+void DetectBurnout(float accel){
+  if (accel <= 0 && systemState == 2){
+    systemState = 3;
+
+    //log in MEL
+  }
+}
+
+void DetectApogee(float vel){
+  if (vel <= 2 && systemState == 3){
+    systemState = 4;//switch to descent
+
+    //log in MEL
+  }
+}
+
+void DetectTouchdown(float altitude){
+  if (altitude < 5 && systemState == 4){
+    systemState = 5;//switch to SAFE
+
+    //log in MEL
+  }
+}
